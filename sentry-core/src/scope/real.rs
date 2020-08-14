@@ -3,10 +3,12 @@ use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::protocol::{Breadcrumb, Context, Event, Level, User, Value};
+use crate::session::Session;
 use crate::Client;
 
 #[derive(Debug)]
 pub struct Stack {
+    pub(crate) session: Option<Session>,
     layers: Vec<StackLayer>,
 }
 
@@ -85,6 +87,7 @@ impl Stack {
     pub fn from_client_and_scope(client: Option<Arc<Client>>, scope: Arc<Scope>) -> Stack {
         Stack {
             layers: vec![StackLayer { client, scope }],
+            session: None,
         }
     }
 

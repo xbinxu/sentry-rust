@@ -11,6 +11,7 @@ use rand::random;
 use crate::constants::SDK_INFO;
 use crate::protocol::{ClientSdkInfo, Event};
 use crate::types::{Dsn, Uuid};
+use crate::Envelope;
 use crate::{ClientOptions, Integration, Scope, Transport};
 
 impl<T: Into<ClientOptions>> From<T> for Client {
@@ -241,6 +242,12 @@ impl Client {
             }
         }
         Default::default()
+    }
+
+    pub(crate) fn capture_envelope(&self, envelope: Envelope) {
+        if let Some(ref transport) = *self.transport.read().unwrap() {
+            transport.send_envelope(envelope);
+        }
     }
 
     /// Drains all pending events and shuts down the transport behind the

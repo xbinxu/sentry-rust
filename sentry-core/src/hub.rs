@@ -9,10 +9,11 @@ use std::thread;
 use std::time::Duration;
 
 use crate::protocol::{Breadcrumb, Event, Level};
+use crate::session::{Session, SessionStatus};
 use crate::types::Uuid;
 use crate::{event_from_error, Integration, IntoBreadcrumbs, Scope, ScopeGuard};
 #[cfg(feature = "client")]
-use crate::{scope::Stack, Client};
+use crate::{scope::Stack, Client, Envelope};
 
 #[cfg(feature = "client")]
 lazy_static::lazy_static! {
@@ -54,6 +55,15 @@ impl HubImpl {
             Ok(guard) => guard,
         };
         guard.top().client.is_some()
+    }
+}
+
+#[cfg(feature = "client")]
+fn record_session_error(stack: &Stack, event: &Event<'static>) {
+    if let Some(session) = stack.session.as_ref() {
+        if event.level >= Level::Error || !event.exception.is_empty() {
+            session.record_errors(1);
+        }
     }
 }
 
@@ -259,6 +269,7 @@ impl Hub {
     pub fn capture_event(&self, event: Event<'static>) -> Uuid {
         with_client_impl! {{
             self.inner.with(|stack| {
+                record_session_error(stack, &event);
                 let top = stack.top();
                 if let Some(ref client) = top.client {
                     let event_id = client.capture_event(event, Some(&top.scope));
@@ -285,6 +296,7 @@ impl Hub {
                         level,
                         ..Default::default()
                     };
+                    record_session_error(stack, &event);
                     self.capture_event(event)
                 } else {
                     Uuid::nil()
@@ -305,6 +317,49 @@ impl Hub {
         self.inner.with_mut(|stack| {
             stack.top_mut().client = client;
         })
+    }
+
+    /// Start a new session for Release Health.
+    ///
+    /// This implicitly closes any previous session and starts recording a new
+    /// session.
+    ///
+    /// See the global [`start_session`](fn.start_session.html)
+    /// for more documentation.
+    // XXX: we would really love to return a `SessionGuard` here, but that
+    // need to have a reference to the Hub, and we can’t create an `Arc<Hub>`
+    // from a `&Hub`, unless its internally refcounted, which it should
+    // ideally be anyway!
+    pub fn start_session(&self) {
+        self.stop_session();
+        // in theory, this could race and we should really do the stop/set in a
+        // single locked section.
+        with_client_impl! {{
+            self.inner.with_mut(|stack| {
+                let session = Session::new();
+                stack.session = Some(session);
+            });
+        }}
+    }
+
+    /// Stop the current Release Health session.
+    ///
+    /// See the global [`stop_session`](fn.stop_session.html)
+    /// for more documentation.
+    pub fn stop_session(&self) {
+        with_client_impl! {{
+            let _ = self.inner.with_mut(|stack| {
+                let mut session = stack.session.take()?;
+                let client = stack.top().client.as_ref()?;
+                session.status = SessionStatus::Exited;
+                let duration = session.started.elapsed().as_secs_f64();
+                session.duration = Some(duration);
+                let mut envelope = Envelope::new();
+                envelope.add(session.into());
+                client.capture_envelope(envelope);
+                None::<()>
+            });
+        }}
     }
 
     /// Pushes a new scope.
