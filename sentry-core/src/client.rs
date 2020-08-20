@@ -12,7 +12,7 @@ use crate::constants::SDK_INFO;
 use crate::protocol::{ClientSdkInfo, Event};
 use crate::types::{Dsn, Uuid};
 use crate::Envelope;
-use crate::{ClientOptions, Integration, Scope, Transport};
+use crate::{session::SessionUpdate, ClientOptions, Integration, Scope, Transport};
 
 impl<T: Into<ClientOptions>> From<T> for Client {
     fn from(o: T) -> Client {
@@ -236,7 +236,20 @@ impl Client {
             if self.sample_should_send() {
                 if let Some(event) = self.prepare_event(event, scope) {
                     let event_id = event.event_id;
-                    transport.send_envelope(event.into());
+                    let session = scope.and_then(|scope| {
+                        if let SessionUpdate::NeedsFlushing(session) =
+                            scope.update_session_from_event(&event)
+                        {
+                            Some(session)
+                        } else {
+                            None
+                        }
+                    });
+                    let mut envelope: Envelope = event.into();
+                    if let Some(session) = session {
+                        envelope.add(session.into());
+                    }
+                    transport.send_envelope(envelope);
                     return event_id;
                 }
             }

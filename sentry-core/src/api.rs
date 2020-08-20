@@ -266,34 +266,6 @@ pub fn last_event_id() -> Option<Uuid> {
 ///
 /// This implicitly closes any previous session and starts recording a new
 /// session.
-///
-/// # Examples
-///
-/// ```
-/// # let envelopes = sentry::test::with_captured_envelopes(|| {
-/// sentry::start_session();
-/// std::thread::sleep(std::time::Duration::from_millis(10));
-///
-/// let err = "NaN".parse::<usize>().unwrap_err();
-/// sentry::capture_error(&err);
-///
-/// sentry::stop_session();
-/// # });
-///
-/// assert_eq!(envelopes.len(), 2);
-///
-/// let mut body = Vec::new();
-/// // the second envelope contains the session
-/// envelopes[1].to_writer(&mut body).unwrap();
-/// assert!(&body.starts_with(b"{}\n{\"type\":\"session\","));
-/// let json: serde_json::Value = serde_json::from_slice(body.split(|c| *c == b'\n').nth(2).unwrap()).unwrap();
-/// let sess = json.as_object().unwrap();
-/// assert_eq!(sess["status"].as_str().unwrap(), "exited");
-/// assert_eq!(sess["errors"].as_u64().unwrap(), 1);
-/// assert_eq!(sess["init"].as_bool(), Some(true));
-/// assert!(sess["duration"].as_f64().unwrap() > 0.01);
-/// //assert_eq!(std::str::from_utf8(json).unwrap(), "");
-/// ```
 pub fn start_session() {
     Hub::with_active(|hub| hub.start_session())
 }
@@ -301,6 +273,6 @@ pub fn start_session() {
 /// Stop the current Release Health session.
 ///
 /// See [`start_session`](fn.start_session.html) for examples.
-pub fn stop_session() {
-    Hub::with_active(|hub| hub.stop_session())
+pub fn end_session() {
+    Hub::with_active(|hub| hub.end_session())
 }

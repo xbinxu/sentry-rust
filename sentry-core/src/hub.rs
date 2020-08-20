@@ -58,15 +58,6 @@ impl HubImpl {
     }
 }
 
-#[cfg(feature = "client")]
-fn record_session_error(stack: &Stack, event: &Event<'static>) {
-    if let Some(session) = stack.session.as_ref() {
-        if event.level >= Level::Error || !event.exception.is_empty() {
-            session.record_errors(1);
-        }
-    }
-}
-
 /// The central object that can manages scopes and clients.
 ///
 /// This can be used to capture events and manage the scope.  This object is
@@ -269,7 +260,6 @@ impl Hub {
     pub fn capture_event(&self, event: Event<'static>) -> Uuid {
         with_client_impl! {{
             self.inner.with(|stack| {
-                record_session_error(stack, &event);
                 let top = stack.top();
                 if let Some(ref client) = top.client {
                     let event_id = client.capture_event(event, Some(&top.scope));
@@ -296,7 +286,6 @@ impl Hub {
                         level,
                         ..Default::default()
                     };
-                    record_session_error(stack, &event);
                     self.capture_event(event)
                 } else {
                     Uuid::nil()
@@ -326,34 +315,31 @@ impl Hub {
     ///
     /// See the global [`start_session`](fn.start_session.html)
     /// for more documentation.
-    // XXX: we would really love to return a `SessionGuard` here, but that
-    // need to have a reference to the Hub, and we can’t create an `Arc<Hub>`
-    // from a `&Hub`, unless its internally refcounted, which it should
-    // ideally be anyway!
     pub fn start_session(&self) {
-        self.stop_session();
+        self.end_session();
         // in theory, this could race and we should really do the stop/set in a
         // single locked section.
         with_client_impl! {{
             self.inner.with_mut(|stack| {
+                let mut scope = Arc::make_mut(&mut stack.top_mut().scope);
                 let session = Session::new();
-                stack.session = Some(session);
+                scope.session = Some(Arc::new(Mutex::new(session)));
             });
         }}
     }
 
     /// Stop the current Release Health session.
     ///
-    /// See the global [`stop_session`](fn.stop_session.html)
+    /// See the global [`end_session`](fn.end_session.html)
     /// for more documentation.
-    pub fn stop_session(&self) {
+    pub fn end_session(&self) {
         with_client_impl! {{
             let _ = self.inner.with_mut(|stack| {
-                let mut session = stack.session.take()?;
+                let mut scope = Arc::make_mut(&mut stack.top_mut().scope);
+                let mut session = Arc::try_unwrap(scope.session.take()?).ok()?.into_inner().ok()?;
                 let client = stack.top().client.as_ref()?;
-                session.status = SessionStatus::Exited;
-                let duration = session.started.elapsed().as_secs_f64();
-                session.duration = Some(duration);
+
+                session.close();
                 let mut envelope = Envelope::new();
                 envelope.add(session.into());
                 client.capture_envelope(envelope);

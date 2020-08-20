@@ -1,43 +1,20 @@
 //! Release Health Sessions
 //!
 //! https://develop.sentry.dev/sdk/sessions/
-//!
 
 use std::fmt;
-use std::str;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use thiserror::Error;
-
+use crate::protocol::{Event, Level};
 use crate::types::{DateTime, Utc, Uuid};
 
-/// An error used when parsing the session `status`.
-#[derive(Debug, Error)]
-#[error("invalid session status")]
-pub struct ParseSessionStatusError;
-
 /// Represents the status of a session.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SessionStatus {
     Ok,
     Crashed,
     Abnormal,
     Exited,
-}
-
-impl str::FromStr for SessionStatus {
-    type Err = ParseSessionStatusError;
-
-    fn from_str(string: &str) -> Result<SessionStatus, Self::Err> {
-        Ok(match string {
-            "ok" => SessionStatus::Ok,
-            "crashed" => SessionStatus::Crashed,
-            "abnormal" => SessionStatus::Abnormal,
-            "exited" => SessionStatus::Exited,
-            _ => return Err(ParseSessionStatusError),
-        })
-    }
 }
 
 impl fmt::Display for SessionStatus {
@@ -60,23 +37,21 @@ impl serde::Serialize for SessionStatus {
     }
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+pub enum SessionUpdate {
+    NeedsFlushing(Session),
+    Unchanged,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Session {
-    pub(crate) session_id: Uuid,
-    pub(crate) status: SessionStatus,
-    // this is atomic to avoid having a writer lock on the scope stack
-    pub(crate) errors: AtomicUsize,
-    #[serde(skip)]
-    pub(crate) started: Instant,
-    #[serde(rename = "started")]
+    session_id: Uuid,
+    status: SessionStatus,
+    errors: usize,
+    started: Instant,
     started_utc: DateTime<Utc>,
-    pub(crate) duration: Option<f64>,
-    #[serde(skip_serializing_if = "is_false")]
-    pub(crate) init: bool,
+    duration: Option<f64>,
+    init: bool,
+    dirty: bool,
 }
 
 impl Session {
@@ -84,49 +59,148 @@ impl Session {
         Self {
             session_id: Uuid::new_v4(),
             status: SessionStatus::Ok,
-            errors: AtomicUsize::new(0),
+            errors: 0,
             started: Instant::now(),
             started_utc: Utc::now(),
             duration: None,
             init: true,
+            dirty: true,
         }
     }
 
-    pub(crate) fn record_errors(&self, errors: usize) {
-        self.errors.fetch_add(errors, Ordering::SeqCst);
-    }
-}
+    pub(crate) fn set_user(&mut self, user: ()) {}
 
-impl Clone for Session {
-    fn clone(&self) -> Self {
-        Self {
-            session_id: self.session_id,
-            status: self.status,
-            errors: AtomicUsize::new(self.errors.load(Ordering::SeqCst)),
-            started: self.started.clone(),
-            started_utc: self.started_utc.clone(),
-            duration: self.duration.clone(),
-            init: self.init,
+    pub(crate) fn update_from_event(&mut self, event: &Event<'static>) -> SessionUpdate {
+        let mut has_error = event.level >= Level::Error;
+        let mut is_crash = false;
+        for exc in &event.exception.values {
+            has_error = true;
+            if let Some(mechanism) = &exc.mechanism {
+                if matches!(mechanism.handled, Some(false)) {
+                    is_crash = true;
+                    break;
+                }
+            }
+        }
+
+        if is_crash {
+            self.status = SessionStatus::Crashed;
+        }
+        if has_error {
+            self.errors += 1;
+            self.dirty = true;
+        }
+
+        if self.dirty {
+            self.dirty = false;
+            let session = self.clone();
+            self.init = false;
+            SessionUpdate::NeedsFlushing(session)
+        } else {
+            SessionUpdate::Unchanged
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.duration = Some(self.started.elapsed().as_secs_f64());
+        if self.status == SessionStatus::Ok {
+            self.status = SessionStatus::Exited;
         }
     }
 }
-
-// impl serde::Serialize for Session {
-//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-//     where
-//         S: serde::Serializer,
-//     {
-//         let mut state = serializer.serialize_struct("Color", 3)?;
-//         state.serialize_field("r", &self.r)?;
-//         state.serialize_field("g", &self.g)?;
-//         state.serialize_field("b", &self.b)?;
-//         state.end()
-//         serializer.serialize_str(&self.to_string())
-//     }
-// }
 
 impl Default for Session {
     fn default() -> Self {
         Session::new()
+    }
+}
+
+impl serde::Serialize for Session {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        //
+        let mut session = serializer.serialize_struct("Session", 6)?;
+        session.serialize_field("sid", &self.session_id)?;
+        session.serialize_field(
+            "status",
+            match self.status {
+                SessionStatus::Ok => "ok",
+                SessionStatus::Crashed => "crashed",
+                SessionStatus::Abnormal => "abnormal",
+                SessionStatus::Exited => "exited",
+            },
+        )?;
+        session.serialize_field("errors", &self.errors)?;
+        session.serialize_field("started", &self.started_utc)?;
+        if let Some(duration) = self.duration {
+            session.serialize_field("duration", &duration)?;
+        } else {
+            session.skip_field("duration")?;
+        }
+        if self.init {
+            session.serialize_field("init", &true)?;
+        } else {
+            session.skip_field("init")?;
+        }
+        session.end()
+        //serializer.serialize_str(&self.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "test"))]
+mod tests {
+    use crate as sentry;
+    use crate::test::with_captured_envelopes_options;
+    use crate::ClientOptions;
+
+    /// let mut body = Vec::new();
+    /// // the second envelope contains the session
+    /// envelopes[1].to_writer(&mut body).unwrap();
+    /// assert!(&body.starts_with(b"{}\n{\"type\":\"session\","));
+    /// let json: serde_json::Value = serde_json::from_slice(body.split(|c| *c == b'\n').nth(2).unwrap()).unwrap();
+    /// let sess = json.as_object().unwrap();
+    /// assert_eq!(sess["status"].as_str().unwrap(), "exited");
+    /// assert_eq!(sess["errors"].as_u64().unwrap(), 1);
+    /// assert_eq!(sess["init"].as_bool(), Some(true));
+    /// assert!(sess["duration"].as_f64().unwrap() > 0.01);
+    /// //assert_eq!(std::str::from_utf8(json).unwrap(), "");
+
+    #[test]
+    fn test_session_startstop() {
+        let envelopes = with_captured_envelopes_options(
+            || {
+                sentry::start_session();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                sentry::end_session();
+            },
+            ClientOptions {
+                ..Default::default()
+            },
+        );
+        assert_eq!(envelopes.len(), 1);
+        dbg!(envelopes);
+    }
+
+    #[test]
+    fn test_session_error() {
+        let envelopes = with_captured_envelopes_options(
+            || {
+                sentry::start_session();
+
+                let err = "NaN".parse::<usize>().unwrap_err();
+                sentry::capture_error(&err);
+
+                sentry::end_session();
+            },
+            ClientOptions {
+                ..Default::default()
+            },
+        );
+        assert_eq!(envelopes.len(), 2);
+        dbg!(envelopes);
     }
 }
