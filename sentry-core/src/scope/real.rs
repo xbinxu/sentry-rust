@@ -188,9 +188,6 @@ impl Scope {
     /// Sets the user for the current scope.
     pub fn set_user(&mut self, user: Option<User>) {
         self.user = user.map(Arc::new);
-        if let Some(mut session) = self.session.as_ref().and_then(|s| s.try_lock().ok()) {
-            session.set_user(self.user.clone());
-        }
     }
 
     /// Sets a tag to a specific value.

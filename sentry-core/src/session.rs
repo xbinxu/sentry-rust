@@ -80,10 +80,6 @@ impl Session {
         })
     }
 
-    pub(crate) fn set_user(&mut self, user: Option<Arc<User>>) {
-        self.user = user;
-    }
-
     pub(crate) fn update_from_event(&mut self, event: &Event<'static>) -> SessionUpdate {
         let mut has_error = event.level >= Level::Error;
         let mut is_crash = false;
@@ -137,8 +133,20 @@ impl serde::Serialize for Session {
     {
         use serde::ser::SerializeStruct;
 
-        let mut session = serializer.serialize_struct("Session", 7)?;
+        let mut session = serializer.serialize_struct("Session", 8)?;
         session.serialize_field("sid", &self.session_id)?;
+        let did = self.user.as_ref().and_then(|user| {
+            user.id
+                .as_ref()
+                .or_else(|| user.email.as_ref())
+                .or_else(|| user.username.as_ref())
+        });
+        if let Some(did) = did {
+            session.serialize_field("did", &did)?;
+        } else {
+            session.skip_field("did")?;
+        }
+
         session.serialize_field(
             "status",
             match self.status {
