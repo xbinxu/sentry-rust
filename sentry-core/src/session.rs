@@ -3,16 +3,21 @@
 //! https://develop.sentry.dev/sdk/sessions/
 
 use std::fmt;
-use std::time::Instant;
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use crate::protocol::{Event, Level};
-use crate::types::{DateTime, Utc, Uuid};
+use crate::{
+    scope::StackLayer,
+    types::{DateTime, Utc, Uuid},
+};
+use sentry_types::protocol::v7::User;
 
 /// Represents the status of a session.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SessionStatus {
     Ok,
     Crashed,
+    #[allow(dead_code)]
     Abnormal,
     Exited,
 }
@@ -47,6 +52,9 @@ pub struct Session {
     session_id: Uuid,
     status: SessionStatus,
     errors: usize,
+    user: Option<Arc<User>>,
+    release: Cow<'static, str>,
+    environment: Option<Cow<'static, str>>,
     started: Instant,
     started_utc: DateTime<Utc>,
     duration: Option<f64>,
@@ -55,20 +63,26 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new() -> Self {
-        Self {
+    pub fn from_stack(stack: &StackLayer) -> Option<Self> {
+        let options = stack.client.as_ref()?.options();
+        Some(Self {
             session_id: Uuid::new_v4(),
             status: SessionStatus::Ok,
             errors: 0,
+            user: stack.scope.user.clone(),
+            release: options.release.clone()?,
+            environment: options.environment.clone(),
             started: Instant::now(),
             started_utc: Utc::now(),
             duration: None,
             init: true,
             dirty: true,
-        }
+        })
     }
 
-    pub(crate) fn set_user(&mut self, user: ()) {}
+    pub(crate) fn set_user(&mut self, user: Option<Arc<User>>) {
+        self.user = user;
+    }
 
     pub(crate) fn update_from_event(&mut self, event: &Event<'static>) -> SessionUpdate {
         let mut has_error = event.level >= Level::Error;
@@ -109,10 +123,11 @@ impl Session {
     }
 }
 
-impl Default for Session {
-    fn default() -> Self {
-        Session::new()
-    }
+#[derive(serde::Serialize)]
+struct Attrs {
+    release: Cow<'static, str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<Cow<'static, str>>,
 }
 
 impl serde::Serialize for Session {
@@ -122,8 +137,7 @@ impl serde::Serialize for Session {
     {
         use serde::ser::SerializeStruct;
 
-        //
-        let mut session = serializer.serialize_struct("Session", 6)?;
+        let mut session = serializer.serialize_struct("Session", 7)?;
         session.serialize_field("sid", &self.session_id)?;
         session.serialize_field(
             "status",
@@ -136,6 +150,7 @@ impl serde::Serialize for Session {
         )?;
         session.serialize_field("errors", &self.errors)?;
         session.serialize_field("started", &self.started_utc)?;
+
         if let Some(duration) = self.duration {
             session.serialize_field("duration", &duration)?;
         } else {
@@ -146,8 +161,16 @@ impl serde::Serialize for Session {
         } else {
             session.skip_field("init")?;
         }
+
+        session.serialize_field(
+            "attrs",
+            &Attrs {
+                release: self.release.clone(),
+                environment: self.environment.clone(),
+            },
+        )?;
+
         session.end()
-        //serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -155,19 +178,16 @@ impl serde::Serialize for Session {
 mod tests {
     use crate as sentry;
     use crate::test::with_captured_envelopes_options;
-    use crate::ClientOptions;
+    use crate::{ClientOptions, Envelope};
 
-    /// let mut body = Vec::new();
-    /// // the second envelope contains the session
-    /// envelopes[1].to_writer(&mut body).unwrap();
-    /// assert!(&body.starts_with(b"{}\n{\"type\":\"session\","));
-    /// let json: serde_json::Value = serde_json::from_slice(body.split(|c| *c == b'\n').nth(2).unwrap()).unwrap();
-    /// let sess = json.as_object().unwrap();
-    /// assert_eq!(sess["status"].as_str().unwrap(), "exited");
-    /// assert_eq!(sess["errors"].as_u64().unwrap(), 1);
-    /// assert_eq!(sess["init"].as_bool(), Some(true));
-    /// assert!(sess["duration"].as_f64().unwrap() > 0.01);
-    /// //assert_eq!(std::str::from_utf8(json).unwrap(), "");
+    fn to_buf(envelope: &Envelope) -> Vec<u8> {
+        let mut vec = Vec::new();
+        envelope.to_writer(&mut vec).unwrap();
+        vec
+    }
+    fn to_str(envelope: &Envelope) -> String {
+        String::from_utf8(to_buf(envelope)).unwrap()
+    }
 
     #[test]
     fn test_session_startstop() {
@@ -178,11 +198,17 @@ mod tests {
                 sentry::end_session();
             },
             ClientOptions {
+                release: Some("some-release".into()),
                 ..Default::default()
             },
         );
         assert_eq!(envelopes.len(), 1);
-        dbg!(envelopes);
+
+        let body = to_str(&envelopes[0]);
+        assert!(body.starts_with("{}\n{\"type\":\"session\","));
+        assert!(body.contains(r#""attrs":{"release":"some-release"}"#));
+        assert!(body.contains(r#""status":"exited","errors":0"#));
+        assert!(body.contains(r#""init":true"#));
     }
 
     #[test]
@@ -197,10 +223,21 @@ mod tests {
                 sentry::end_session();
             },
             ClientOptions {
+                release: Some("some-release".into()),
                 ..Default::default()
             },
         );
         assert_eq!(envelopes.len(), 2);
-        dbg!(envelopes);
+
+        let body = to_str(&envelopes[0]);
+        assert!(body.contains("{\"type\":\"session\","));
+        assert!(body.contains(r#""attrs":{"release":"some-release"}"#));
+        assert!(body.contains(r#""status":"ok","errors":1"#));
+        assert!(body.contains(r#""init":true"#));
+
+        let body = to_str(&envelopes[1]);
+        assert!(body.contains("{\"type\":\"session\","));
+        assert!(body.contains(r#""status":"exited","errors":1"#));
+        assert!(!body.contains(r#""init":true"#));
     }
 }

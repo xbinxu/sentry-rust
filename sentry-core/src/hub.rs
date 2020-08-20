@@ -317,13 +317,14 @@ impl Hub {
     /// for more documentation.
     pub fn start_session(&self) {
         self.end_session();
-        // in theory, this could race and we should really do the stop/set in a
+        // in theory, this could race and we should really do the end/start in a
         // single locked section.
         with_client_impl! {{
             self.inner.with_mut(|stack| {
-                let mut scope = Arc::make_mut(&mut stack.top_mut().scope);
-                let session = Session::new();
-                scope.session = Some(Arc::new(Mutex::new(session)));
+                if let Some(session) = Session::from_stack(stack.top()) {
+                    let mut scope = Arc::make_mut(&mut stack.top_mut().scope);
+                    scope.session = Some(Arc::new(Mutex::new(session)));
+                }
             });
         }}
     }

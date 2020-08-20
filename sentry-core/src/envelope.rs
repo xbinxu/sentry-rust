@@ -122,6 +122,7 @@ impl From<Event<'static>> for Envelope {
 #[cfg(test)]
 mod test {
     use super::*;
+
     fn to_buf(envelope: Envelope) -> Vec<u8> {
         let mut vec = Vec::new();
         envelope.to_writer(&mut vec).unwrap();
