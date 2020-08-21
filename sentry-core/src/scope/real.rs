@@ -93,8 +93,12 @@ impl Stack {
     }
 
     pub fn push(&mut self) {
-        let scope = self.layers[self.layers.len() - 1].clone();
-        self.layers.push(scope);
+        let mut layer = self.layers[self.layers.len() - 1].clone();
+        // don’t clone the session itself, it should only be on one layer, so
+        // that `end`-ing it works correctly.
+        let mut scope = Arc::make_mut(&mut layer.scope);
+        scope.session = None;
+        self.layers.push(layer);
     }
 
     pub fn pop(&mut self) -> Option<StackLayer> {
