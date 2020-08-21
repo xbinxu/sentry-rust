@@ -198,7 +198,7 @@ implement_http_transport! {
                     builder.build().unwrap()
                 });
 
-                let url = dsn.store_api_url().to_string();
+                let url = dsn.envelope_api_url().to_string();
 
                 while let Some(envelope) = receiver.recv().unwrap_or(None) {
                     // on drop we want to not continue processing the queue.
@@ -225,6 +225,7 @@ implement_http_transport! {
                     let mut body = Vec::new();
                     envelope.to_writer(&mut body).unwrap();
 
+                    sentry_debug!("sending to \"{}\"", url);
                     match http_client
                         .post(url.as_str())
                         .body(body)
@@ -232,6 +233,7 @@ implement_http_transport! {
                         .send()
                     {
                         Ok(resp) => {
+                            sentry_debug!("got response {} {:#?}", resp.status(), resp.headers());
                             if resp.status() == 429 {
                                 if let Some(retry_after) = resp
                                     .headers()
@@ -242,6 +244,7 @@ implement_http_transport! {
                                     disabled = Some(retry_after);
                                 }
                             }
+                            sentry_debug!("{}", resp.text().unwrap());
                         }
                         Err(err) => {
                             sentry_debug!("Failed to send event: {}", err);
@@ -290,7 +293,7 @@ implement_http_transport! {
 
         thread::spawn(move || {
             sentry_debug!("spawning curl transport");
-            let url = dsn.store_api_url().to_string();
+            let url = dsn.envelope_api_url().to_string();
 
             while let Some(envelope) = receiver.recv().unwrap_or(None) {
                 // on drop we want to not continue processing the queue.
@@ -422,7 +425,7 @@ implement_http_transport! {
             .spawn(move || {
                 sentry_debug!("spawning surf transport");
                 let http_client = http_client;
-                let url = dsn.store_api_url().to_string();
+                let url = dsn.envelope_api_url().to_string();
 
                 while let Some(envelope) = receiver.recv().unwrap_or(None) {
                     // on drop we want to not continue processing the queue.

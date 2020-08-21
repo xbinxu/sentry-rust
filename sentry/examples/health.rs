@@ -6,6 +6,13 @@ fn main() {
         ..Default::default()
     });
 
+    let handle = std::thread::spawn(|| {
+        // this session will be set to crashed
+        sentry::start_session();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        panic!("oh no!");
+    });
+
     sentry::start_session();
 
     sentry::capture_message(
@@ -22,4 +29,6 @@ fn main() {
     // so this session will increase the errors count by 2, but otherwise has
     // a clean exit.
     sentry::end_session();
+
+    handle.join().ok();
 }
