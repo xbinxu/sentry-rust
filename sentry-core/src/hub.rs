@@ -49,9 +49,9 @@ impl HubImpl {
     }
 
     fn is_active_and_usage_safe(&self) -> bool {
-        let guard = match self.stack.try_read() {
-            Err(TryLockError::Poisoned(err)) => err.into_inner(),
-            Err(TryLockError::WouldBlock) => return false,
+        let guard = match self.stack.read() {
+            Err(err) => err.into_inner(),
+            //Err(TryLockError::WouldBlock) => return false,
             Ok(guard) => guard,
         };
         guard.top().client.is_some()
@@ -171,6 +171,7 @@ impl Hub {
                 if hub.is_active_and_usage_safe() {
                     f(hub)
                 } else {
+                    //assert!(false);
                     Default::default()
                 }
             })
