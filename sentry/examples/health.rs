@@ -9,8 +9,9 @@ fn main() {
     let handle = std::thread::spawn(|| {
         // this session will be set to crashed
         sentry::start_session();
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        panic!("oh no!");
+        //std::thread::sleep(std::time::Duration::from_secs(3));
+        //panic!("oh no!");
+        //sentry::end_session();
     });
 
     sentry::start_session();

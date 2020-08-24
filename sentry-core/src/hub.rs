@@ -343,6 +343,7 @@ impl Hub {
                 session.close();
                 let mut envelope = Envelope::new();
                 envelope.add(session.into());
+                sentry_debug!("capturing envelope for session close");
                 client.capture_envelope(envelope);
                 None::<()>
             });
