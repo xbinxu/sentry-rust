@@ -345,9 +345,7 @@ impl Hub {
                 let client = stack.top().client.as_ref()?;
 
                 session.close();
-                let mut envelope = Envelope::new();
-                envelope.add(session.into());
-                client.capture_envelope(envelope);
+                client.send_session(session);
                 None::<()>
             });
         }}

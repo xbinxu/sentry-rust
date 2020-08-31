@@ -2,23 +2,27 @@ use std::any::TypeId;
 use std::borrow::Cow;
 use std::fmt;
 use std::panic::RefUnwindSafe;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use rand::random;
 
 use crate::constants::SDK_INFO;
 use crate::protocol::{ClientSdkInfo, Event};
-use crate::session::SessionUpdate;
+use crate::session::{Session, SessionUpdate};
 use crate::types::{Dsn, Uuid};
-use crate::{ClientOptions, Envelope, Hub, Integration, Scope, Transport};
+use crate::{
+    envelope::MAX_ENVELOPE_ITEMS, ClientOptions, Envelope, Hub, Integration, Scope, Transport,
+};
 
 impl<T: Into<ClientOptions>> From<T> for Client {
     fn from(o: T) -> Client {
         Client::with_options(o.into())
     }
 }
+
+type PendingSessions = Arc<Mutex<Option<Vec<Session>>>>;
+const SESSION_FLUSH_INTERVAL: Duration = std::time::Duration::from_secs(10);
 
 /// The Sentry Client.
 ///
@@ -40,6 +44,7 @@ impl<T: Into<ClientOptions>> From<T> for Client {
 pub struct Client {
     options: ClientOptions,
     transport: RwLock<Option<Arc<dyn Transport>>>,
+    pending_sessions: PendingSessions,
     integrations: Vec<(TypeId, Arc<dyn Integration>)>,
     sdk_info: ClientSdkInfo,
 }
@@ -57,11 +62,44 @@ impl Clone for Client {
     fn clone(&self) -> Client {
         Client {
             options: self.options.clone(),
+            pending_sessions: Arc::new(Mutex::new(Some(Vec::new()))),
             transport: RwLock::new(self.transport.read().unwrap().clone()),
             integrations: self.integrations.clone(),
             sdk_info: self.sdk_info.clone(),
         }
     }
+}
+
+fn flush_sessions(transport: &dyn Transport, sessions: Vec<Session>) {
+    let mut items = 0;
+    let mut envelope = Envelope::new();
+    for session in sessions {
+        if items >= MAX_ENVELOPE_ITEMS {
+            transport.send_envelope(envelope);
+            envelope = Envelope::new();
+        }
+        envelope.add(session.into());
+        items += 1;
+    }
+    transport.send_envelope(envelope);
+}
+
+fn spawn_session_flusher<F>(sessions: PendingSessions, f: F)
+where
+    F: Fn(Vec<Session>) + Send + Sync + 'static,
+{
+    std::thread::Builder::new()
+        .name("sentry-session-flusher".into())
+        .spawn(|| loop {
+            std::thread::sleep(SESSION_FLUSH_INTERVAL);
+            let sessions = match *sessions.lock().unwrap() {
+                opt @ Some(_) => opt.replace(Vec::new()).unwrap(),
+                None => return,
+            };
+
+            f(sessions);
+        })
+        .unwrap();
 }
 
 impl Client {
@@ -121,9 +159,17 @@ impl Client {
             sdk_info.integrations.push(integration.name().to_string());
         }
 
+        let pending_sessions = Arc::new(Mutex::new(Some(Vec::new())));
+        spawn_session_flusher(pending_sessions.clone(), |sessions| {
+            if let Some(transport) = *transport.read().unwrap() {
+                flush_sessions(transport.as_ref(), sessions);
+            }
+        });
+
         Client {
             options,
             transport,
+            pending_sessions,
             integrations,
             sdk_info,
         }
@@ -262,6 +308,12 @@ impl Client {
         Default::default()
     }
 
+    pub(crate) fn send_session(&self, session: Session) {
+        if let Some(ref mut sessions) = *self.pending_sessions.lock().unwrap() {
+            sessions.push(session);
+        }
+    }
+
     pub(crate) fn capture_envelope(&self, envelope: Envelope) {
         if let Some(ref transport) = *self.transport.read().unwrap() {
             transport.send_envelope(envelope);
@@ -277,6 +329,9 @@ impl Client {
     /// `shutdown_timeout` in the client options.
     pub fn close(&self, timeout: Option<Duration>) -> bool {
         if let Some(transport) = self.transport.write().unwrap().take() {
+            if let Some(sessions) = self.pending_sessions.lock().unwrap().take() {
+                flush_sessions(transport.as_ref(), sessions);
+            }
             sentry_debug!("client close; request transport to shut down");
             transport.shutdown(timeout.unwrap_or(self.options.shutdown_timeout))
         } else {

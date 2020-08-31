@@ -4,6 +4,8 @@ use crate::protocol::Event;
 use crate::session::Session;
 use crate::types::Uuid;
 
+pub(crate) const MAX_ENVELOPE_ITEMS: usize = 100;
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub(crate) enum EnvelopeItem {
