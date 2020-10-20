@@ -7,8 +7,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::client::TransportArc;
+use crate::clientoptions::SessionMode;
 use crate::protocol::{
-    EnvelopeItem, Event, Level, SessionAttributes, SessionStatus, SessionUpdate,
+    AggregateItem, EnvelopeItem, Event, Level, SessionAggregates, SessionAttributes, SessionStatus,
+    SessionUpdate,
 };
 use crate::scope::StackLayer;
 use crate::types::{Utc, Uuid};
@@ -118,19 +120,19 @@ impl Session {
 const MAX_SESSION_ITEMS: usize = 100;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
-type SessionQueue = Arc<Mutex<Vec<SessionUpdate<'static>>>>;
+type SessionQueue = (
+    Vec<SessionUpdate<'static>>,
+    Option<SessionAggregates<'static>>,
+);
 
 /// Background Session Flusher
 ///
 /// The background flusher queues session updates for delayed batched sending.
 /// It has its own background thread that will flush its queue once every
 /// `FLUSH_INTERVAL`.
-///
-/// For now it just batches all the session updates together into one envelope,
-/// but in the future it will also pre-aggregate session numbers.
 pub(crate) struct SessionFlusher {
     transport: TransportArc,
-    queue: SessionQueue,
+    queue: Arc<Mutex<SessionQueue>>,
     shutdown: Arc<(Mutex<bool>, Condvar)>,
     worker: Option<JoinHandle<()>>,
 }
@@ -138,7 +140,7 @@ pub(crate) struct SessionFlusher {
 impl SessionFlusher {
     /// Creates a new Flusher that will submit envelopes to the given `transport`.
     pub fn new(transport: TransportArc) -> Self {
-        let queue = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(Default::default()));
         #[allow(clippy::mutex_atomic)]
         let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -180,12 +182,63 @@ impl SessionFlusher {
 
     /// Enqueues a session update for delayed sending.
     ///
-    /// When the queue is full, it will be flushed immediately.
-    pub fn enqueue(&self, session_update: SessionUpdate<'static>) {
+    /// This will aggregate session counts in request mode, for all sessions
+    /// that were not yet partially sent.
+    pub fn enqueue(&self, session_update: SessionUpdate<'static>, mode: SessionMode) {
         let mut queue = self.queue.lock().unwrap();
-        queue.push(session_update);
-        if queue.len() >= MAX_SESSION_ITEMS {
-            SessionFlusher::flush(queue, &self.transport);
+        if mode == SessionMode::Application || !session_update.init {
+            queue.0.push(session_update);
+            if queue.0.len() >= MAX_SESSION_ITEMS {
+                SessionFlusher::flush(queue, &self.transport);
+            }
+            return;
+        }
+
+        let aggregate = queue.1.get_or_insert_with(|| SessionAggregates {
+            aggregates: vec![],
+            attributes: session_update.attributes.clone(),
+        });
+
+        use chrono::{Duration, DurationRound};
+        let started = session_update
+            .started
+            .duration_trunc(Duration::hours(1))
+            .unwrap();
+
+        // this would be so nice if `find_or_push_with` existed
+        let mut group = aggregate.aggregates.iter_mut().find(|group| {
+            group.started == started && group.distinct_id == session_update.distinct_id
+        });
+        if group.is_none() {
+            aggregate.aggregates.push(AggregateItem {
+                started,
+                distinct_id: session_update.distinct_id.clone(),
+                exited: 0,
+                errored: 0,
+                abnormal: 0,
+                crashed: 0,
+            });
+            group = aggregate.aggregates.last_mut();
+        }
+        if let Some(group) = group {
+            match session_update.status {
+                SessionStatus::Exited => {
+                    if session_update.errors > 0 {
+                        group.errored += 1;
+                    } else {
+                        group.exited += 1;
+                    }
+                }
+                SessionStatus::Crashed => {
+                    group.crashed += 1;
+                }
+                SessionStatus::Abnormal => {
+                    group.abnormal += 1;
+                }
+                SessionStatus::Ok => {
+                    // TODO: maybe assert here?
+                }
+            }
         }
     }
 
@@ -193,10 +246,20 @@ impl SessionFlusher {
     ///
     /// This is a static method as it will be called from both the background
     /// thread and the main thread on drop.
-    fn flush(mut queue_lock: MutexGuard<Vec<SessionUpdate<'static>>>, transport: &TransportArc) {
-        let queue: Vec<_> = std::mem::take(queue_lock.as_mut());
+    fn flush(mut queue_lock: MutexGuard<SessionQueue>, transport: &TransportArc) {
+        let (queue, aggregate) = (std::mem::take(&mut queue_lock.0), queue_lock.1.take());
         drop(queue_lock);
 
+        // send aggregates
+        if let Some(aggregate) = aggregate {
+            if let Some(ref transport) = *transport.read().unwrap() {
+                let mut envelope = Envelope::new();
+                envelope.add_item(aggregate);
+                transport.send_envelope(envelope);
+            }
+        }
+
+        // send individual items
         if queue.is_empty() {
             return;
         }
@@ -212,6 +275,7 @@ impl SessionFlusher {
                 envelope = Envelope::new();
                 items = 0;
             }
+
             envelope.add_item(session_update);
             items += 1;
         }
@@ -277,7 +341,6 @@ mod tests {
 
     #[test]
     fn test_session_batching() {
-        #![allow(clippy::match_like_matches_macro)]
         let envelopes = capture_envelopes(|| {
             for _ in 0..(MAX_SESSION_ITEMS * 2) {
                 sentry::start_session();
@@ -289,11 +352,87 @@ mod tests {
         let items = envelopes[0].items().chain(envelopes[1].items());
         assert_eq!(items.clone().count(), MAX_SESSION_ITEMS * 2);
         for item in items {
-            assert!(match item {
-                EnvelopeItem::SessionUpdate(_) => true,
-                _ => false,
-            });
+            assert!(matches!(item, EnvelopeItem::SessionUpdate(_)));
         }
+    }
+
+    #[test]
+    fn test_session_aggregation() {
+        let envelopes = crate::test::with_captured_envelopes_options(
+            || {
+                sentry::start_session();
+                // this error will be captured along with an individual update.
+                let err = "NaN".parse::<usize>().unwrap_err();
+                sentry::capture_error(&err);
+
+                for _ in 0..50 {
+                    sentry::start_session();
+                }
+                sentry::end_session();
+
+                sentry::configure_scope(|scope| {
+                    scope.set_user(Some(sentry::User {
+                        id: Some("foo-bar".into()),
+                        ..Default::default()
+                    }));
+                    scope.add_event_processor(Box::new(|_| None));
+                });
+
+                for _ in 0..50 {
+                    sentry::start_session();
+                }
+
+                // this error will be discarded because of the event processor,
+                // but the session will still be updated accordingly.
+                let err = "NaN".parse::<usize>().unwrap_err();
+                sentry::capture_error(&err);
+            },
+            crate::ClientOptions {
+                release: Some("some-release".into()),
+                session_mode: SessionMode::Request,
+                ..Default::default()
+            },
+        );
+        assert_eq!(envelopes.len(), 3);
+
+        let session_id;
+
+        let mut items = envelopes[0].items();
+        assert!(matches!(items.next(), Some(EnvelopeItem::Event(_))));
+        if let Some(EnvelopeItem::SessionUpdate(session)) = items.next() {
+            session_id = session.session_id;
+            assert_eq!(session.status, SessionStatus::Ok);
+            assert_eq!(session.errors, 1);
+            assert_eq!(session.init, true);
+        } else {
+            panic!("expected session");
+        }
+        assert_eq!(items.next(), None);
+
+        let mut items = envelopes[1].items();
+        if let Some(EnvelopeItem::SessionAggregates(aggregate)) = items.next() {
+            let aggregates = &aggregate.aggregates;
+            assert_eq!(aggregates[0].distinct_id, None);
+            assert_eq!(aggregates[0].exited, 50);
+
+            assert_eq!(aggregates[1].distinct_id, Some("foo-bar".into()));
+            assert_eq!(aggregates[1].exited, 49);
+            assert_eq!(aggregates[1].errored, 1);
+        } else {
+            panic!("expected session");
+        }
+        assert_eq!(items.next(), None);
+
+        let mut items = envelopes[2].items();
+        if let Some(EnvelopeItem::SessionUpdate(session)) = items.next() {
+            assert_eq!(session.session_id, session_id);
+            assert_eq!(session.status, SessionStatus::Exited);
+            assert_eq!(session.errors, 1);
+            assert_eq!(session.init, false);
+        } else {
+            panic!("expected session");
+        }
+        assert_eq!(items.next(), None);
     }
 
     #[test]

@@ -337,16 +337,8 @@ impl Hub {
         with_client_impl! {{
             self.inner.with_mut(|stack| {
                 let top = stack.top_mut();
-                if let Some(mut session) = top.scope.session.lock().unwrap().take() {
-                    session.close();
-                    if let Some(item) = session.create_envelope_item() {
-                        let mut envelope = Envelope::new();
-                        envelope.add_item(item);
-                        if let Some(ref client) = top.client {
-                            client.capture_envelope(envelope);
-                        }
-                    }
-                }
+                // drop will close and enqueue the session
+                top.scope.session.lock().unwrap().take();
             })
         }}
     }
